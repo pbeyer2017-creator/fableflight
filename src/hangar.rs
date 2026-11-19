@@ -475,6 +475,8 @@ pub struct SetInfo {
     pub author: String,
     /// the pilot's view (view 0): right, up, aft of the model's origin (m)
     pub eye: Option<[f32; 3]>,
+    /// its default livery and the texture properties it sets
+    pub paint: crate::fgmodel::Paint,
 }
 
 /// A path written in one of the aircraft's files, as a path inside its folder
@@ -561,7 +563,8 @@ fn read_set(get: &dyn Fn(&str) -> Option<Vec<u8>>, id: &str, folder: &str) -> Re
         (Some(x), Some(y), Some(z)) => Some([x, y, z]),
         _ => None,
     };
-    Ok(SetInfo { fdm: v("sim/flight-model").to_lowercase(), aero: v("sim/aero"), model, description: v("sim/description"), author: v("sim/author"), eye })
+    let paint = crate::fgmodel::Paint::from_set(&m);
+    Ok(SetInfo { fdm: v("sim/flight-model").to_lowercase(), aero: v("sim/aero"), model, description: v("sim/description"), author: v("sim/author"), eye, paint })
 }
 
 /// What the menu shows of an aircraft (before it is downloaded): its
@@ -863,6 +866,8 @@ pub struct FgFiles {
     pub still: Option<&'static [u8]>,
     /// the pilot's eye from its own view (right, up, aft of the model's origin, m)
     pub eye: Option<[f32; 3]>,
+    /// its default livery, from its `-set.xml`
+    pub paint: crate::fgmodel::Paint,
 }
 
 fn fit(j: &jsbsim::Aircraft, parts: &[(Option<Part>, Option<Part>)], folder: &str, name: &str, model: Option<&FgFiles>) -> Result<(Spec, Summary), String> {
@@ -1091,7 +1096,7 @@ fn own_geometry(s: &mut Spec, base: &Spec, j: &jsbsim::Aircraft, fg: &FgFiles, f
         s.gear = Box::leak(legs.into_boxed_slice());
         s.gear_rate = if bogeys.iter().any(|c| c.retractable) { base.gear_rate.max(1.0 / 6.0) } else { 0.0 };
     }
-    s.ext = Some(Box::leak(Box::new(crate::fgmodel::Ext { dir: fg.dir.clone(), fg_dir: folder.to_string(), model: fg.model.clone(), origin, steer_max: s.steer_max as f32, travel, span: span as f32 })));
+    s.ext = Some(Box::leak(Box::new(crate::fgmodel::Ext { dir: fg.dir.clone(), fg_dir: folder.to_string(), model: fg.model.clone(), paint: fg.paint.clone(), origin, steer_max: s.steer_max as f32, travel, span: span as f32 })));
     if let Some(still) = fg.still {
         s.still = still;
     }
@@ -1296,7 +1301,7 @@ pub fn load(dir: &Path) -> Result<&'static Spec, String> {
         f => return Err(format!("it flies on {}, not JSBSim or YASim", if f.is_empty() { "an unknown flight model" } else { f })),
     };
     let model = if set.model.is_empty() { None } else { Some(dir.join(&set.model)) }.filter(|p| p.exists());
-    let fg = model.map(|m| FgFiles { dir: dir.to_path_buf(), model: m, still: still_of(dir), eye: set.eye });
+    let fg = model.map(|m| FgFiles { dir: dir.to_path_buf(), model: m, still: still_of(dir), eye: set.eye, paint: set.paint.clone() });
     if fg.is_none() {
         log::warn!("{folder}: no 3D model found ({:?}); drawn as its stand-in", set.model);
     }
@@ -1478,7 +1483,7 @@ mod tests {
         let base = &aircraft::c172::SPEC;
         let mut s = base.clone();
         assert!(!s.hotspots.is_empty());
-        let fg = FgFiles { dir: PathBuf::new(), model: PathBuf::from("Models/test.xml"), still: None, eye: None };
+        let fg = FgFiles { dir: PathBuf::new(), model: PathBuf::from("Models/test.xml"), still: None, eye: None, paint: Default::default() };
         own_geometry(&mut s, base, &jsbsim::Aircraft::default(), &fg, "test", base.mass, 1.0, base.b);
         assert!(s.ext.is_some());
         assert!(s.hotspots.is_empty());

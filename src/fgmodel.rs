@@ -42,6 +42,8 @@ pub struct Ext {
     pub fg_dir: String,
     /// the model file (XML, or an .ac on its own)
     pub model: PathBuf,
+    /// which livery it wears
+    pub paint: Paint,
     /// where the model's origin (the VRP) is in our body frame
     pub origin: Vec3,
     /// our steering's full angle (rad), and each leg's oleo travel (m), for scaling the drives
@@ -49,6 +51,80 @@ pub struct Ext {
     pub travel: Vec<f32>,
     /// span (m), for sorting its parts into the breakable groups
     pub span: f32,
+}
+
+/// An aircraft's paint, as its `-set.xml` gives it.
+///
+/// FlightGear paints a model with `material` animations: named objects take
+/// the texture a property holds (`sim/model/livery/texture-fuselage`). A Nasal
+/// script fills those properties from a livery file (`Models/Liveries/DD.xml`),
+/// the one `sim/model/livery/file` names. We run no Nasal, so we read that
+/// file ourselves; the set file's own texture properties come under it.
+#[derive(Clone, Debug, Default)]
+pub struct Paint {
+    /// the default livery file's name, without `.xml` ("DD")
+    pub livery: Option<String>,
+    /// texture properties the set file sets ("sim/model/livery/texture" → "Liveries/side1.nasa.png")
+    pub props: Vec<(String, String)>,
+}
+
+impl Paint {
+    /// From a set file's properties, flattened ("sim/model/livery/file" → "DD").
+    pub fn from_set(m: &HashMap<String, String>) -> Paint {
+        let livery = m.get("sim/model/livery/file").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let mut props: Vec<(String, String)> = m
+            .iter()
+            .filter(|(k, v)| k.starts_with("sim/model/") && k.rsplit('/').next().is_some_and(|l| l.starts_with("texture")) && !v.trim().is_empty())
+            .map(|(k, v)| (k.clone(), v.trim().to_string()))
+            .collect();
+        props.sort();
+        Paint { livery, props }
+    }
+}
+
+/// A property file's leaf values, by path ("sim/model/livery/texture-wing1").
+fn flat_props(n: roxmltree::Node, prefix: &str, out: &mut HashMap<String, String>) {
+    for c in n.children().filter(|c| c.is_element()) {
+        let key = if prefix.is_empty() { c.tag_name().name().to_string() } else { format!("{prefix}/{}", c.tag_name().name()) };
+        if c.children().any(|x| x.is_element()) {
+            flat_props(c, &key, out);
+        } else if let Some(t) = c.text().map(str::trim).filter(|t| !t.is_empty()) {
+            out.entry(key).or_insert_with(|| t.to_string());
+        }
+    }
+}
+
+/// The folder a model's Nasal hands to FlightGear's livery code
+/// (`aircraft.livery_update.new("Aircraft/p51d/Models/Liveries", 10)`), as written.
+fn livery_dir_in(nasal: &str) -> Option<&str> {
+    for call in ["livery_update.new(", "livery.init("] {
+        if let Some(i) = nasal.find(call) {
+            let rest = &nasal[i + call.len()..];
+            let a = rest.find('"')? + 1;
+            let b = a + rest[a..].find('"')?;
+            return Some(&rest[a..b]);
+        }
+    }
+    None
+}
+
+/// The textures a `material` animation can put on its objects, best first:
+/// what its property holds, then its own default.
+fn material_textures(a: roxmltree::Node, props: &HashMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(tp) = txt(a, "texture-prop") {
+        let key = match txt(a, "property-base") {
+            Some(b) => format!("{}/{}", b.trim_matches('/'), tp.trim_matches('/')),
+            None => tp.trim_matches('/').to_string(),
+        };
+        if let Some(v) = props.get(&key) {
+            out.push(v.clone());
+        }
+    }
+    if let Some(t) = txt(a, "texture").filter(|t| !t.is_empty()) {
+        out.push(t.to_string());
+    }
+    out
 }
 
 // ------------------------------------------------------------------ AC3D
@@ -324,6 +400,10 @@ struct Loader<'a> {
     anims: Vec<AnimDef>,
     order: usize,
     warn: Vec<String>,
+    /// the livery's texture properties (its file's, over the set file's)
+    paint: HashMap<String, String>,
+    /// objects a `material` animation gives another texture: the file it is in
+    tex_over: HashMap<usize, PathBuf>,
 }
 
 fn num(n: roxmltree::Node, k: &str) -> Option<f32> {
@@ -436,6 +516,42 @@ impl<'a> Loader<'a> {
         q.exists().then_some(q)
     }
 
+    /// A texture a model file names, where it really is: the same name as
+    /// .png/.rgb/.jpg/.dds too, then under the model's `Liveries` folder
+    /// (where many models keep a default their XML names bare).
+    fn find_texture(&self, base: &Path, t: &str) -> Option<PathBuf> {
+        let t = t.trim().replace('\\', "/");
+        let with = |s: &str| -> Vec<String> {
+            let stem = s.rsplit_once('.').filter(|(a, _)| !a.ends_with('/')).map(|(a, _)| a).unwrap_or(s);
+            let mut v = vec![s.to_string()];
+            v.extend(["png", "rgb", "jpg", "dds"].iter().map(|e| format!("{stem}.{e}")));
+            v
+        };
+        let file = t.rsplit('/').next().unwrap_or(&t).to_string();
+        with(&t).iter().find_map(|c| self.resolve(base, c)).or_else(|| with(&format!("Liveries/{file}")).iter().find_map(|c| self.resolve(base, c)))
+    }
+
+    /// Reads the default livery file into `paint`, given the root model file's folder and text.
+    fn read_livery(&mut self, base: &Path, root: roxmltree::Node) {
+        let Some(name) = self.ext.paint.livery.clone() else { return };
+        let nasal: String = root.descendants().filter(|n| n.has_tag_name("nasal")).flat_map(|n| n.descendants().filter_map(|d| d.text())).collect();
+        let dir = livery_dir_in(&nasal).and_then(|d| self.resolve(base, d)).unwrap_or_else(|| base.join("Liveries"));
+        let file = dir.join(format!("{name}.xml"));
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            self.warn.push(format!("livery {} missing", file.display()));
+            return;
+        };
+        let Ok(doc) = roxmltree::Document::parse(&text) else {
+            self.warn.push(format!("livery {}: bad XML", file.display()));
+            return;
+        };
+        let mut m = HashMap::new();
+        flat_props(doc.root_element(), "", &mut m);
+        log::info!("FlightGear model: livery {} ({} properties)", file.display(), m.len());
+        // (the livery's own values over the set file's)
+        self.paint.extend(m);
+    }
+
     /// Loads a model file (or a bare .ac) placed by `xf`; returns the objects it brought in.
     fn load(&mut self, path: &Path, xf: Mat4, level: usize) -> Vec<usize> {
         if level > 8 {
@@ -456,6 +572,9 @@ impl<'a> Loader<'a> {
         let root = doc.root_element();
         let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let xf = xf * offsets(root.children().find(|c| c.has_tag_name("offsets")));
+        if level == 0 {
+            self.read_livery(&base, root);
+        }
         let mut mine: Vec<usize> = Vec::new();
         // name -> objects, for this file's animations
         let mut names: HashMap<String, Vec<usize>> = HashMap::new();
@@ -498,6 +617,18 @@ impl<'a> Loader<'a> {
             objs.sort_unstable();
             objs.dedup();
             let ty = txt(a, "type").unwrap_or("");
+            if ty == "material" {
+                // Paint: the first of its textures that is there, on its objects (outer files over inner).
+                if let Some(p) = material_textures(a, &self.paint).iter().find_map(|t| self.find_texture(&base, t)) {
+                    for &o in &objs {
+                        self.tex_over.insert(o, p.clone());
+                    }
+                }
+                if let Some(n) = txt(a, "name") {
+                    names.entry(n.to_string()).or_default().extend(objs.clone());
+                }
+                continue;
+            }
             let def = self.anim(a, ty, xf);
             if let Some(n) = txt(a, "name") {
                 // later animations may name the group this one made
@@ -684,23 +815,33 @@ impl Ext {
     /// Reads the model and builds ours from it.
     pub fn build(&self) -> Result<Model, String> {
         let t0 = std::time::Instant::now();
-        let mut ld = Loader { ext: self, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new() };
+        let paint: HashMap<String, String> = self.paint.props.iter().cloned().collect();
+        let mut ld = Loader { ext: self, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint, tex_over: HashMap::new() };
         ld.load(&self.model, Mat4::IDENTITY, 0);
         if ld.objs.is_empty() {
             return Err(format!("its model {} has nothing in it", self.model.display()));
         }
         let to_body = |v: Vec3| fg_to_body(v) + self.origin;
 
+        // Each object's chain of animations, innermost first.
+        for o in &mut ld.objs {
+            o.chain.sort_by(|a, b| b.0 .0.cmp(&a.0 .0).then(b.0 .1.total_cmp(&a.0 .1)).then(a.0 .2.cmp(&b.0 .2)));
+        }
+
         // Textures: every one the meshes use, in one array.
         let mut tex_ids: HashMap<PathBuf, i32> = HashMap::new();
         let mut images: Vec<image::RgbaImage> = Vec::new();
-        for o in &ld.objs {
-            let (ac, base, _) = &ld.acs[o.ac];
-            let Some(t) = &ac.objs[o.idx].texture else { continue };
-            if t.is_empty() {
-                continue;
+        // An object's texture: the livery's (a material animation's), else its mesh's own.
+        let tex_of = |i: usize| -> Option<PathBuf> {
+            if let Some(p) = ld.tex_over.get(&i) {
+                return Some(p.clone());
             }
-            let p = base.join(t);
+            let o = &ld.objs[i];
+            let (ac, base, _) = &ld.acs[o.ac];
+            ac.objs[o.idx].texture.as_ref().filter(|t| !t.is_empty()).map(|t| base.join(t))
+        };
+        for i in 0..ld.objs.len() {
+            let Some(p) = tex_of(i) else { continue };
             if tex_ids.contains_key(&p) {
                 continue;
             }
@@ -725,11 +866,6 @@ impl Ext {
         };
         let layers: Vec<Vec<u8>> = images.iter().map(|i| image::imageops::resize(i, size, size, image::imageops::FilterType::Triangle).into_raw()).collect();
 
-        // Each object's chain of animations, innermost first.
-        for o in &mut ld.objs {
-            o.chain.sort_by(|a, b| b.0 .0.cmp(&a.0 .0).then(b.0 .1.total_cmp(&a.0 .1)).then(a.0 .2.cmp(&b.0 .2)));
-        }
-
         // Pieces: one per distinct chain of moving animations (outermost first)
         // and breakable group; the static ones are baked into the vertices.
         let mut pieces: Vec<Piece> = Vec::new();
@@ -746,7 +882,7 @@ impl Ext {
         }
         let len = (hi.z - lo.z).max(1.0);
         let mut n_tris = 0usize;
-        for o in &ld.objs {
+        for (oi, o) in ld.objs.iter().enumerate() {
             let (ac, _, xf) = &ld.acs[o.ac];
             let a = &ac.objs[o.idx];
             if a.surfs.is_empty() {
@@ -805,7 +941,7 @@ impl Ext {
             } else {
                 airframe::G_FUSE
             };
-            let tex = a.texture.as_ref().filter(|t| !t.is_empty()).and_then(|t| tex_ids.get(&ld.acs[o.ac].1.join(t))).copied().unwrap_or(-1);
+            let tex = tex_of(oi).and_then(|p| tex_ids.get(&p).copied()).unwrap_or(-1);
             // Glass: a see-through material, or a texture with see-through parts on a propeller blur.
             let mut solid = Mesh::default();
             let mut glass = Mesh::default();
@@ -977,6 +1113,50 @@ mod tests {
         d.extend([10, 20, 30, 40, 50, 60]);
         let i = read_sgi(&d).unwrap();
         assert_eq!(i.get_pixel(0, 0).0, [10, 30, 50, 255]);
+    }
+
+    #[test]
+    fn livery_folder_from_nasal() {
+        assert_eq!(livery_dir_in("var l = aircraft.livery_update.new(\"Aircraft/p51d/Models/Liveries\", 10);"), Some("Aircraft/p51d/Models/Liveries"));
+        assert_eq!(livery_dir_in("aircraft.livery.init(\"Aircraft/c310/Models/Liveries\");"), Some("Aircraft/c310/Models/Liveries"));
+        assert_eq!(livery_dir_in("print(\"hello\");"), None);
+    }
+
+    #[test]
+    fn paint_from_set_and_material_order() {
+        let m: HashMap<String, String> = [("sim/model/livery/file", "DD"), ("sim/model/livery/texture", "Liveries/side1.nasa.png"), ("sim/model/path", "Models/x.xml")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let p = Paint::from_set(&m);
+        assert_eq!(p.livery.as_deref(), Some("DD"));
+        assert_eq!(p.props, vec![("sim/model/livery/texture".to_string(), "Liveries/side1.nasa.png".to_string())]);
+        // the property's texture comes before the animation's own default
+        let doc = roxmltree::Document::parse("<animation><type>material</type><property-base>/sim/model/livery</property-base><texture-prop>texture</texture-prop><texture>side1.rgb</texture></animation>").unwrap();
+        let props: HashMap<String, String> = p.props.into_iter().collect();
+        assert_eq!(material_textures(doc.root_element(), &props), vec!["Liveries/side1.nasa.png".to_string(), "side1.rgb".to_string()]);
+        assert_eq!(material_textures(doc.root_element(), &HashMap::new()), vec!["side1.rgb".to_string()]);
+    }
+
+    #[test]
+    fn default_livery_paints_its_objects() {
+        // A tiny aircraft: a bare-metal mesh, and a livery file the set names.
+        let dir = std::env::temp_dir().join(format!("fg-livery-test-{}", std::process::id()));
+        let models = dir.join("Models");
+        std::fs::create_dir_all(models.join("Liveries")).unwrap();
+        let ac = "AC3Db\nMATERIAL \"m\" rgb 1 1 1  amb 0 0 0  emis 0 0 0  spec 0 0 0  shi 10  trans 0\nOBJECT world\nkids 2\nOBJECT poly\nname \"fuselage\"\ntexture \"bare.png\"\nnumvert 3\n0 0 0\n0 1 0\n0 0 1\nnumsurf 1\nSURF 0x10\nmat 0\nrefs 3\n0 0 0\n1 1 0\n2 0 1\nkids 0\nOBJECT poly\nname \"canopy\"\ntexture \"bare.png\"\nnumvert 3\n0 0 0\n0 1 0\n0 0 1\nnumsurf 1\nSURF 0x10\nmat 0\nrefs 3\n0 0 0\n1 1 0\n2 0 1\nkids 0\n";
+        std::fs::write(models.join("x.ac"), ac).unwrap();
+        std::fs::write(models.join("x.xml"), "<PropertyList><path>x.ac</path><nasal><load>var l = aircraft.livery_update.new(\"Aircraft/xx/Models/Liveries\", 10);</load></nasal><animation><type>material</type><object-name>fuselage</object-name><property-base>sim/model/livery</property-base><texture-prop>texture-fuselage</texture-prop><texture>DDfuselage.png</texture></animation></PropertyList>").unwrap();
+        std::fs::write(models.join("Liveries").join("DD.xml"), "<PropertyList><sim><model><livery><texture-fuselage>Liveries/DDfuselage.png</texture-fuselage></livery></model></sim></PropertyList>").unwrap();
+        std::fs::write(models.join("Liveries").join("DDfuselage.png"), b"png").unwrap();
+        let ext = Ext { dir: dir.clone(), fg_dir: "xx".into(), model: models.join("x.xml"), paint: Paint { livery: Some("DD".into()), props: Vec::new() }, origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0 };
+        let mut ld = Loader { ext: &ext, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
+        ld.load(&ext.model, Mat4::IDENTITY, 0);
+        let painted: Vec<(String, PathBuf)> = ld.tex_over.iter().map(|(o, p)| (ld.acs[ld.objs[*o].ac].0.objs[ld.objs[*o].idx].name.clone(), p.clone())).collect();
+        assert_eq!(painted, vec![("fuselage".to_string(), models.join("Liveries/DDfuselage.png"))], "warnings: {:?}", ld.warn);
+        // No livery named: the animation's bare default is found under Liveries/ all the same.
+        let ext2 = Ext { paint: Paint::default(), ..ext.clone() };
+        let mut ld2 = Loader { ext: &ext2, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
+        ld2.load(&ext2.model, Mat4::IDENTITY, 0);
+        assert_eq!(ld2.tex_over.values().cloned().collect::<Vec<_>>(), vec![models.join("Liveries/DDfuselage.png")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
