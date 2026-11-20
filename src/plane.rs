@@ -683,6 +683,7 @@ impl Plane {
             Input::Mach => self.mach() as f32,
             Input::Canopy => self.canopy as f32,
             Input::Speedbrake => self.speedbrake as f32,
+            Input::N1 => (self.n1 * 100.0) as f32,
         }
     }
 

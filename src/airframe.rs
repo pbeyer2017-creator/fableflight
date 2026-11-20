@@ -625,6 +625,8 @@ pub enum Input {
     Canopy,
     /// the speed brake handle, 0 stowed .. 1 (`Plane::speedbrake`; the spoilers follow it in flight)
     Speedbrake,
+    /// a jet's fan speed in percent (FlightGear's `engines/engine/n1`, `n2`); 0 for a piston engine
+    N1,
 }
 
 /// How an input is shaped before it moves a piece.
@@ -635,6 +637,8 @@ pub enum Curve {
     Smooth(f32, f32),
     /// up over a..b, back down over c..d (a door that opens for the gear to pass and closes behind it)
     Pulse(f32, f32, f32, f32),
+    /// 0 below a, 1 above b, straight between (a FlightGear table of two entries, held at its ends)
+    Ramp(f32, f32),
 }
 
 /// `offset + gain * curve(input)`: radians for a hinge, metres for a slide.
@@ -672,6 +676,7 @@ impl Drive {
             Curve::Lin => x,
             Curve::Smooth(a, b) => smoothstep(a, b, x),
             Curve::Pulse(a, b, c, d) => smoothstep(a, b, x) * (1.0 - smoothstep(c, d, x)),
+            Curve::Ramp(a, b) => ((x - a) / (b - a)).clamp(0.0, 1.0),
         };
         self.offset + self.gain * y
     }

@@ -432,7 +432,8 @@ fn input_of(p: &str, ext: &Ext) -> Option<(Input, f32)> {
         "controls/flight/elevator" => (Input::Pitch, 1.0),
         "controls/flight/aileron" => (Input::Roll, 1.0),
         "controls/flight/rudder" => (Input::Yaw, 1.0),
-        "controls/engines/engine/throttle" | "controls/engines/engine[0]/throttle" => (Input::Throttle, 1.0),
+        // (one throttle moves every engine's: a twin's right nozzle reads engine[1])
+        _ if p.starts_with("controls/engines/engine") && p.ends_with("/throttle") => (Input::Throttle, 1.0),
         "gear/gear/position-norm" => (Input::Gear, 1.0),
         _ if p.starts_with("gear/gear") && p.ends_with("/position-norm") => (Input::Gear, 1.0),
         _ if p.starts_with("controls/gear/gear-down") => (Input::Gear, 1.0),
@@ -445,7 +446,9 @@ fn input_of(p: &str, ext: &Ext) -> Option<(Input, f32)> {
         _ if p.starts_with("gear/gear") && p.ends_with("/compression-ft") => (Input::Compress(leg(p)), 1.0 / 0.3048),
         _ if p.starts_with("gear/gear") && (p.ends_with("/rollspeed-ms") || p.ends_with("/wow")) => (Input::Wheel(leg(p)), 1.0),
         _ if p.starts_with("engines/engine") && p.ends_with("/reverser-pos-norm") => (Input::Reverser, 1.0),
-        _ if p.starts_with("engines/engine") && (p.ends_with("/rpm") || p.ends_with("/n1") || p.ends_with("/n2") || p.contains("propeller")) => (Input::Prop, 1.0),
+        // A jet's fan speed (percent) moves its nozzle petals; a `spin` on it turns the fan instead (see `anim`).
+        _ if p.starts_with("engines/engine") && (p.ends_with("/n1") || p.ends_with("/n2")) => (Input::N1, 1.0),
+        _ if p.starts_with("engines/engine") && (p.ends_with("/rpm") || p.contains("propeller")) => (Input::Prop, 1.0),
         _ => return None,
     })
 }
@@ -693,11 +696,13 @@ impl<'a> Loader<'a> {
         let deg = matches!(kind, Kind::Rotate);
         let factor = num(a, "factor").unwrap_or(1.0);
         let offset = if deg { num(a, "offset-deg") } else { num(a, "offset-m") }.unwrap_or(0.0);
-        let table: Vec<(f32, f32)> = a
+        let mut table: Vec<(f32, f32)> = a
             .children()
             .find(|c| c.has_tag_name("interpolation"))
             .map(|t| t.children().filter(|e| e.has_tag_name("entry")).filter_map(|e| Some((num(e, "ind")?, num(e, "dep")?))).collect())
             .unwrap_or_default();
+        // FlightGear keeps a table in order of its input, however it was written (the B-1B's runs 100 down to 75)
+        table.sort_by(|p, q| p.0.total_cmp(&q.0));
         let prop = txt(a, "property").unwrap_or("");
         let spin = ty == "spin";
         let at_rest = |x: f32| -> f32 {
@@ -726,6 +731,8 @@ impl<'a> Loader<'a> {
         d.rest = if spin { 0.0 } else { at_rest(0.0) };
         let k = if deg { std::f32::consts::PI / 180.0 } else { 1.0 };
         if let Some((input, unit)) = input_of(prop, self.ext) {
+            // a fan spun by its speed turns with the engine's fan angle
+            let input = if spin && input == Input::N1 { Input::Prop } else { input };
             if spin {
                 // A turning propeller or wheel: our angle, in the direction it turns.
                 d.drive = Some(Drive::new(input, factor.signum()));
@@ -743,16 +750,9 @@ impl<'a> Loader<'a> {
                 } else {
                     let first = table.iter().position(|e| (e.1 - y0).abs() > 1e-4).map(|i| table[i - 1].0).unwrap_or(x0);
                     let last = table.iter().rposition(|e| (e.1 - y1).abs() > 1e-4).map(|i| table[i + 1].0).unwrap_or(x1);
-                    let curve = if table.len() == 2 { Curve::Lin } else { Curve::Smooth(s(first), s(last)) };
+                    // (two entries: straight between them and held beyond, as FlightGear does)
                     let mut dr = Drive::new(input, (y1 - y0) * k).offset(y0 * k);
-                    match curve {
-                        Curve::Lin => {
-                            // y0 + (y1 - y0) (x - x0) / (x1 - x0), in our units
-                            let g = (y1 - y0) / (x1 - x0).max(1e-6) * unit;
-                            dr = Drive::new(input, g * k).offset((y0 - g / unit * x0) * k);
-                        }
-                        _ => dr.curve = curve,
-                    }
+                    dr.curve = if table.len() == 2 { Curve::Ramp(s(x0), s(x1)) } else { Curve::Smooth(s(first), s(last)) };
                     d.drive = Some(dr);
                 }
             } else {
@@ -1157,6 +1157,31 @@ mod tests {
         ld2.load(&ext2.model, Mat4::IDENTITY, 0);
         assert_eq!(ld2.tex_over.values().cloned().collect::<Vec<_>>(), vec![models.join("Liveries/DDfuselage.png")]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nozzle_petals_follow_fan_speed_and_every_throttle() {
+        let ext = Ext { dir: PathBuf::new(), fg_dir: String::new(), model: PathBuf::new(), paint: Paint::default(), origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0 };
+        let mut ld = Loader { ext: &ext, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
+        let deg = |dr: Drive, x: f32| dr.eval(x).to_degrees();
+        // The B-1B's petal, its table written from 100 down to 75 (percent N2): 17 deg below 75, 2 at full.
+        let b1 = "<animation><type>rotate</type><object-name>p</object-name><property>engines/engine[0]/n2</property><interpolation><entry><ind>100.0</ind><dep>2.0</dep></entry><entry><ind>75.0</ind><dep>17.0</dep></entry></interpolation><axis><x>0</x><y>1</y><z>0</z></axis></animation>";
+        let doc = roxmltree::Document::parse(b1).unwrap();
+        let dr = ld.anim(doc.root_element(), "rotate", Mat4::IDENTITY).unwrap().drive.unwrap();
+        assert_eq!(dr.input, Input::N1);
+        for (n, want) in [(0.0, 17.0), (75.0, 17.0), (87.5, 9.5), (100.0, 2.0), (110.0, 2.0)] {
+            assert!((deg(dr, n) - want).abs() < 1e-3, "at {n}% N2: {} deg, want {want}", deg(dr, n));
+        }
+        // A fan spun by its speed still turns with the fan angle.
+        let fan = "<animation><type>spin</type><object-name>f</object-name><property>engines/engine[1]/n1</property><factor>-1</factor><axis><x>1</x><y>0</y><z>0</z></axis></animation>";
+        let doc = roxmltree::Document::parse(fan).unwrap();
+        assert_eq!(ld.anim(doc.root_element(), "spin", Mat4::IDENTITY).unwrap().drive.unwrap().input, Input::Prop);
+        // The MiG-29's right nozzle reads the second engine's throttle.
+        let mig = "<animation><type>rotate</type><object-name>n</object-name><property>controls/engines/engine[1]/throttle</property><interpolation><entry><ind>0</ind><dep>15</dep></entry><entry><ind>0.4</ind><dep>15</dep></entry><entry><ind>0.8</ind><dep>10</dep></entry><entry><ind>1</ind><dep>0</dep></entry></interpolation><axis><x>0</x><y>0</y><z>-1</z></axis></animation>";
+        let doc = roxmltree::Document::parse(mig).unwrap();
+        let dr = ld.anim(doc.root_element(), "rotate", Mat4::IDENTITY).unwrap().drive.unwrap();
+        assert_eq!(dr.input, Input::Throttle);
+        assert!((deg(dr, 0.0) - 15.0).abs() < 1e-3 && deg(dr, 1.0).abs() < 1e-3);
     }
 
     #[test]
