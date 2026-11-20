@@ -261,8 +261,46 @@ fn anim(name: &str, stow: f32) -> Anim {
     }
 }
 
+const FA18_BIN: &[u8] = include_bytes!("../../../assets/fa18.bin.gz");
+
+/// Where plane.wgsl's plume takes the right engine's jet to leave its nozzle
+/// (the default `nozzle()`: the Hornet's), body frame.
+pub const PLUME_NOZZLE: Vec3 = Vec3::new(0.52, -0.05, 8.0);
+/// The radius of that nozzle's jet (plane.wgsl draws the discs across it 0.36 wide)
+pub const PLUME_RADIUS: f32 = 0.36;
+
+/// The right and the left engine's exhaust plumes, as the shader lights them
+/// (sheath, core and discs: `mat.w` 1..3), in the Hornet's body frame.
+/// Downloaded jets borrow them, placed on their own nozzles (fgmodel.rs), a
+/// left engine taking the left one. The heat haze (layer 0) is left out: one
+/// shell across both engines, it redraws the scene behind it, so moved onto
+/// another aircraft's nozzles it would paint over a neighbouring flame.
+pub fn plume() -> [Mesh; 2] {
+    let objs = load(FA18_BIN, "fa18");
+    let Some(o) = objs.get("afterburner") else { return [Mesh::default(), Mesh::default()] };
+    let mut out = [Mesh::default(), Mesh::default()];
+    let mut map: [HashMap<u32, u32>; 2] = [HashMap::new(), HashMap::new()];
+    for t in o.mesh.i.chunks_exact(3) {
+        let v = |k: u32| &o.mesh.v[k as usize];
+        if (v(t[0]).mat[3] + 0.5) as u32 == 0 {
+            continue;
+        }
+        // (each engine's shells lie wholly on its own side of the middle)
+        let side = if t.iter().map(|&k| v(k).pos[0]).sum::<f32>() > 0.0 { 0 } else { 1 };
+        let m = &mut out[side];
+        for &k in t {
+            let n = *map[side].entry(k).or_insert_with(|| {
+                m.v.push(*v(k));
+                m.v.len() as u32 - 1
+            });
+            m.i.push(n);
+        }
+    }
+    out
+}
+
 pub fn build() -> Model {
-    let objs = load(include_bytes!("../../../assets/fa18.bin.gz"), "fa18");
+    let objs = load(FA18_BIN, "fa18");
     let mut b = Builder::default();
     let mut at: HashMap<&str, usize> = HashMap::new();
     for &(name, group, role, parent) in PIECES {

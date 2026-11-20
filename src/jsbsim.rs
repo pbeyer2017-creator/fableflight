@@ -146,6 +146,8 @@ pub struct Aircraft {
     pub cg: Option<[f64; 3]>,
     pub vrp: Option<[f64; 3]>,
     pub eye: Option<[f64; 3]>,
+    /// where each engine's thrust acts (its thruster's location, or a YASim jet's position)
+    pub jets: Vec<[f64; 3]>,
     /// the ground reactions, in file order (a 3D model's gear\[n\] is the n-th)
     pub contacts: Vec<Contact>,
 }
@@ -167,7 +169,7 @@ pub struct Polar {
 
 impl Default for Aircraft {
     fn default() -> Aircraft {
-        Aircraft { name: String::new(), source: "JSBSim", wing_area_ft2: 0.0, span_ft: 0.0, chord_ft: 0.0, inertia: [0.0; 3], weight_lbs: 0.0, travel: HashMap::new(), empty_lbs: 0.0, points_lbs: 0.0, fuel_lbs: 0.0, fuel_cap_lbs: 0.0, flaps_max_deg: None, engines: Vec::new(), author: String::new(), description: String::new(), license: None, notes: String::new(), functions: Vec::new(), axes: Vec::new(), cg: None, vrp: None, eye: None, contacts: Vec::new() }
+        Aircraft { name: String::new(), source: "JSBSim", wing_area_ft2: 0.0, span_ft: 0.0, chord_ft: 0.0, inertia: [0.0; 3], weight_lbs: 0.0, travel: HashMap::new(), empty_lbs: 0.0, points_lbs: 0.0, fuel_lbs: 0.0, fuel_cap_lbs: 0.0, flaps_max_deg: None, engines: Vec::new(), author: String::new(), description: String::new(), license: None, notes: String::new(), functions: Vec::new(), axes: Vec::new(), cg: None, vrp: None, eye: None, jets: Vec::new(), contacts: Vec::new() }
     }
 }
 
@@ -448,6 +450,9 @@ impl Aircraft {
                     for e in n.children().filter(|c| c.has_tag_name("engine")) {
                         let Some(f) = e.attribute("file") else { continue };
                         let th = child(e, "thruster").and_then(|t| t.attribute("file")).map(str::to_string);
+                        if let Some(at) = child(e, "thruster").and_then(|t| child(t, "location")).and_then(location) {
+                            a.jets.push(at);
+                        }
                         a.engines.push((f.to_string(), th));
                     }
                 }

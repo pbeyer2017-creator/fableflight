@@ -877,9 +877,18 @@ pub struct Model {
     pub tex: Option<std::sync::Arc<crate::fgmodel::TexSet>>,
     /// the conditions `Vis::When` pieces are drawn under
     pub conds: Vec<Cond>,
+    /// pieces drawn somewhere other than their mesh frame says (a downloaded jet's
+    /// exhaust plumes: the Hornet's, which the shader lights in its own frame, moved
+    /// onto each nozzle), and the transform after their pose
+    pub placed: Vec<(usize, Mat4)>,
 }
 
 impl Model {
+    /// Where piece i is drawn, given its pose.
+    pub fn place(&self, i: usize, pose: Mat4) -> Mat4 {
+        self.placed.iter().find(|p| p.0 == i).map_or(pose, |p| pose * p.1)
+    }
+
     /// Whether a piece is drawn, given the plane's inputs (`blur`: how far its propeller has blurred, 0..1).
     pub fn shown(&self, p: &Piece, blur: f32, chute_out: bool, input: &impl Fn(Input) -> f32) -> bool {
         match p.vis {
@@ -936,7 +945,7 @@ impl Model {
                 groups[p.group].append(&p.mesh);
             }
         }
-        Model { pieces, groups, tex: None, conds: Vec::new() }
+        Model { pieces, groups, tex: None, conds: Vec::new(), placed: Vec::new() }
     }
     /// Centre and half size of everything solid in it (body frame, at rest).
     /// (Temporal anti-aliasing tells the aircraft's pixels by this box. A NaN

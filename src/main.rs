@@ -2190,7 +2190,7 @@ impl Game {
                 if hide {
                     continue;
                 }
-                objs.push(DrawObj { mesh: mesh[i], model: base * pose[i], tint: [blur, 0.0, 0.0, 0.0], glow: [0.0, spec.id as f32, 0.0, 0.0], params, cast: 0b11, glass: p.glass, cut: cut[i], ..DrawObj::DEFAULT });
+                objs.push(DrawObj { mesh: mesh[i], model: base * model.place(i, pose[i]), tint: [blur, 0.0, 0.0, 0.0], glow: [0.0, spec.id as f32, 0.0, 0.0], params, cast: 0b11, glass: p.glass, cut: cut[i], ..DrawObj::DEFAULT });
             }
             full[k] = true;
         }
@@ -5885,7 +5885,7 @@ impl Game {
                 let torn = tears[0].is_some() || tears[1].is_some();
                 objs.push(DrawObj {
                     mesh: self.piece_mesh[i],
-                    model: base * pose[i],
+                    model: base * self.model.place(i, pose[i]),
                     // (Windows: the phases of the water on them, rain.rs Glass::phases; a
                     // rocket's parts: how thin the air is and how hot its tiles. A rocket
                     // has no windows: its "glass" is the exhaust plumes, which spread by

@@ -46,6 +46,8 @@ pub struct Ext {
     pub paint: Paint,
     /// where the model's origin (the VRP) is in our body frame
     pub origin: Vec3,
+    /// a jet's engines (body frame): an exhaust plume goes on the nozzle behind each
+    pub jets: Vec<Vec3>,
     /// our steering's full angle (rad), and each leg's oleo travel (m), for scaling the drives
     pub steer_max: f32,
     pub travel: Vec<f32>,
@@ -488,6 +490,22 @@ fn cond_eval(n: roxmltree::Node, fast: &mut Option<bool>) -> bool {
         "property" => false,
         _ => true,
     }
+}
+
+/// Each jet's nozzle exit, found on the model: the aftmost skin around the
+/// engine's line (its position fore and aft in the flight model is where its
+/// mass is, not where its exhaust leaves), and that nozzle's radius.
+fn nozzles(pieces: &[Piece], jets: &[Vec3]) -> Vec<(Vec3, f32)> {
+    let mut out = Vec::new();
+    for j in jets {
+        let near = |p: Vec3| (p.x - j.x).hypot(p.y - j.y);
+        let skin = || pieces.iter().filter(|p| !p.glass).flat_map(|p| p.mesh.v.iter()).map(|v| Vec3::from(v.pos)).filter(|p| p.is_finite() && p.z > j.z - 3.0);
+        let Some(z) = skin().filter(|p| near(*p) < 0.5).map(|p| p.z).reduce(f32::max) else { continue };
+        // its radius: how far out the skin within a few centimetres of the exit reaches
+        let r = skin().filter(|p| p.z > z - 0.15 && near(*p) < 0.8).map(near).fold(0.0f32, f32::max);
+        out.push((Vec3::new(j.x, j.y, z), if r > 0.05 { r } else { crate::aircraft::fa18::PLUME_RADIUS }));
+    }
+    out
 }
 
 /// A select's condition, if it turns on something we model (gear, flaps, speedbrake, throttle, fan speed):
@@ -1102,8 +1120,25 @@ impl Ext {
             log::warn!("FlightGear model: {w}");
         }
         log::info!("FlightGear model {}: {} pieces, {} triangles, {} textures at {size}², read in {:.0} ms", self.model.display(), pieces.len(), n_tris, layers.len(), t0.elapsed().as_secs_f64() * 1000.0);
+        // A jet's exhaust: the Hornet's plume on each of its nozzles.
+        let plumes = nozzles(&pieces, &self.jets);
+        let mut placed = Vec::new();
+        if !plumes.is_empty() {
+            let shells = crate::aircraft::fa18::plume();
+            for (at, r) in &plumes {
+                let s = (r / crate::aircraft::fa18::PLUME_RADIUS).clamp(0.7, 1.6);
+                // (a left engine takes the Hornet's left plume, leaving its nozzle on the other side)
+                let left = at.x < -0.05;
+                let n = crate::aircraft::fa18::PLUME_NOZZLE * if left { Vec3::new(-1.0, 1.0, 1.0) } else { Vec3::ONE };
+                let xf = Mat4::from_translation(*at) * Mat4::from_scale(Vec3::splat(s)) * Mat4::from_translation(-n);
+                pieces.push(Piece { hotspot: None, name: "fg plume", mesh: shells[left as usize].clone(), group: airframe::G_TAIL, parent: None, pivot: Vec3::ZERO, axis: Vec3::X, anim: Anim::Fixed, role: Role::Other, vis: Vis::Always, glass: true, occluder: false });
+                placed.push((pieces.len() - 1, xf));
+            }
+            log::info!("FlightGear model: exhaust plumes on {} nozzles: {}", plumes.len(), plumes.iter().map(|(a, r)| format!("({:.2}, {:.2}, {:.2}) r {r:.2}", a.x, a.y, a.z)).collect::<Vec<_>>().join(", "));
+        }
         let mut model = Model::finish(pieces);
         model.conds = conds;
+        model.placed = placed;
         model.tex = Some(std::sync::Arc::new(TexSet { size, layers }));
         Ok(model)
     }
@@ -1214,7 +1249,7 @@ mod tests {
         std::fs::write(models.join("x.xml"), "<PropertyList><path>x.ac</path><nasal><load>var l = aircraft.livery_update.new(\"Aircraft/xx/Models/Liveries\", 10);</load></nasal><animation><type>material</type><object-name>fuselage</object-name><property-base>sim/model/livery</property-base><texture-prop>texture-fuselage</texture-prop><texture>DDfuselage.png</texture></animation></PropertyList>").unwrap();
         std::fs::write(models.join("Liveries").join("DD.xml"), "<PropertyList><sim><model><livery><texture-fuselage>Liveries/DDfuselage.png</texture-fuselage></livery></model></sim></PropertyList>").unwrap();
         std::fs::write(models.join("Liveries").join("DDfuselage.png"), b"png").unwrap();
-        let ext = Ext { dir: dir.clone(), fg_dir: "xx".into(), model: models.join("x.xml"), paint: Paint { livery: Some("DD".into()), props: Vec::new() }, origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0 };
+        let ext = Ext { dir: dir.clone(), fg_dir: "xx".into(), model: models.join("x.xml"), paint: Paint { livery: Some("DD".into()), props: Vec::new() }, origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0, jets: Vec::new() };
         let mut ld = Loader { ext: &ext, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
         ld.load(&ext.model, Mat4::IDENTITY, 0);
         let painted: Vec<(String, PathBuf)> = ld.tex_over.iter().map(|(o, p)| (ld.acs[ld.objs[*o].ac].0.objs[ld.objs[*o].idx].name.clone(), p.clone())).collect();
@@ -1229,7 +1264,7 @@ mod tests {
 
     #[test]
     fn nozzle_petals_follow_fan_speed_and_every_throttle() {
-        let ext = Ext { dir: PathBuf::new(), fg_dir: String::new(), model: PathBuf::new(), paint: Paint::default(), origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0 };
+        let ext = Ext { dir: PathBuf::new(), fg_dir: String::new(), model: PathBuf::new(), paint: Paint::default(), origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0, jets: Vec::new() };
         let mut ld = Loader { ext: &ext, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
         let deg = |dr: Drive, x: f32| dr.eval(x).to_degrees();
         // The B-1B's petal, its table written from 100 down to 75 (percent N2): 17 deg below 75, 2 at full.
@@ -1253,8 +1288,38 @@ mod tests {
     }
 
     #[test]
+    fn plumes_go_on_each_nozzle() {
+        // A nozzle: a ring 0.45 m across around x = 1.5, from z = 3 back to its lip at z = 5,
+        // and a tail fin out at x = 3 reaching further aft (not the nozzle).
+        let mut m = Mesh::default();
+        for k in 0..16 {
+            let a = k as f32 / 16.0 * std::f32::consts::TAU;
+            for z in [3.0, 5.0] {
+                m.v.push(PartVertex { pos: [1.5 + 0.45 * a.cos(), -0.2 + 0.45 * a.sin(), z], ..Default::default() });
+            }
+        }
+        m.v.push(PartVertex { pos: [3.0, 1.0, 7.0], ..Default::default() });
+        let piece = Piece { hotspot: None, name: "fg mesh", mesh: m, group: airframe::G_TAIL, parent: None, pivot: Vec3::ZERO, axis: Vec3::X, anim: Anim::Fixed, role: Role::Other, vis: Vis::Always, glass: false, occluder: true };
+        // (the flight model's jet sits mid-engine, a little off the nozzle's line)
+        let n = nozzles(&[piece], &[Vec3::new(1.45, -0.15, 2.0)]);
+        assert_eq!(n.len(), 1);
+        let (at, r) = n[0];
+        assert!((at.z - 5.0).abs() < 1e-4 && (at.x - 1.45).abs() < 1e-4, "{at:?}");
+        assert!(r > 0.4 && r < 0.6, "radius {r}");
+        // The Hornet's plume it borrows: one engine's, leaving the nozzle the shader expects.
+        let [shell, other] = crate::aircraft::fa18::plume();
+        // (the sheath, core and discs of each engine: 820 + 580 + 240 triangles, no haze)
+        assert_eq!((shell.i.len() / 3, other.i.len() / 3), (1640, 1640));
+        let xr = |m: &Mesh| m.v.iter().map(|v| v.pos[0]).fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
+        let ((r0, r1), (l0, l1)) = (xr(&shell), xr(&other));
+        assert!(r0 > 0.0 && l1 < 0.0 && (r0 + l1).abs() < 0.01 && (r1 + l0).abs() < 0.01, "right {r0}..{r1}, left {l0}..{l1}");
+        let zmin = shell.v.iter().map(|v| v.pos[2]).fold(f32::MAX, f32::min);
+        assert!((zmin - crate::aircraft::fa18::PLUME_NOZZLE.z).abs() < 0.3, "front at {zmin}");
+    }
+
+    #[test]
     fn gear_selects_are_checked_as_it_flies() {
-        let ext = Ext { dir: PathBuf::new(), fg_dir: String::new(), model: PathBuf::new(), paint: Paint::default(), origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0 };
+        let ext = Ext { dir: PathBuf::new(), fg_dir: String::new(), model: PathBuf::new(), paint: Paint::default(), origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0, jets: Vec::new() };
         let mut ld = Loader { ext: &ext, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
         let gear = |g: f32| move |i: Input| if i == Input::Gear { g } else { 0.0 };
         // The MiG-29's wheels: shown once the gear is out (hidden at rest, so they used to be left out altogether).

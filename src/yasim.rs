@@ -171,6 +171,8 @@ pub struct Airplane {
     pub engines: Vec<Engine>,
     /// what the file places itself (engines with their mass, ballast), lbs
     placed: Vec<([f64; 3], f64)>,
+    /// where each jet is (where its exhaust leaves is found on the 3D model)
+    jets: Vec<[f64; 3]>,
     gear: Vec<Gear>,
     tanks: Vec<([f64; 3], f64)>,
     weights: Vec<[f64; 3]>,
@@ -284,6 +286,7 @@ impl Airplane {
                     let t = f(n, "thrust", 0.0);
                     a.engines.push(Engine::Jet { thrust: t, afterburner: f(n, "afterburner", 0.0).max(t) });
                     a.placed.push((pos(n), f(n, "mass", 0.0)));
+                    a.jets.push(pos(n));
                 }
                 "thruster" => a.engines.push(Engine::Jet { thrust: f(n, "thrust", 0.0), afterburner: 0.0 }),
                 "rotor" => a.engines.push(Engine::Rotor),
@@ -504,6 +507,7 @@ impl Airplane {
         a.cg = Some(st(cg));
         a.vrp = Some([0.0; 3]);
         a.eye = self.cockpit.map(st);
+        a.jets = self.jets.iter().map(|p| st(*p)).collect();
         a.contacts = self.contacts(cg, &masses);
         a.set_polar(&polar);
         Ok(a)
