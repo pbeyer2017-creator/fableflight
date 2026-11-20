@@ -27,8 +27,9 @@ the author's big shared files such as `src/main.rs`.
 | Change | Files | Checked |
 |---|---|---|
 | FlightGear imports wear their default livery. The importer runs no Nasal, so it now reads the livery file the set names (`sim/model/livery/file`) and applies `material` animation textures itself. | `src/fgmodel.rs`, `src/hangar.rs` | 3 new unit tests; full `cargo test` (246 pass). Before/after screenshots: P-51D went from blank metal to its "Delivery Day" markings; F-14B unchanged (its default was already right). |
+| FlightGear jet nozzles follow the engine. `n1`/`n2` animations got the propeller's spin angle (0..2π, looping), so petals sat splayed and flickered (B-1B); now they get fan speed in percent. Every engine's throttle (`engine[1]`...) moves, not just engine 0's (MiG-29 right nozzle). Interpolation tables are sorted and held at their ends, as FlightGear does. | `src/fgmodel.rs`, `src/airframe.rs`, `src/plane.rs` | New unit test; full `cargo test` (282 pass). Before/after screenshots: B-1B petals no longer splayed; MiG-29 at full throttle, both nozzles now match. |
 
-Not done yet: choosing among an aircraft's other liveries, Nasal-driven animations (F-14 wing sweep), effect models (afterburner flames).
+Not done yet: choosing among an aircraft's other liveries; gear `select` conditions (evaluated once at load, so gear doors and wheels can stick); exhaust and afterburner effects (skipped); Nasal-driven animations (F-14 wing sweep).
 
 ## Contributing a change back
 
