@@ -2186,12 +2186,7 @@ impl Game {
             let mut params = [[0.0f32; 4]; 6];
             params[5] = [1000.0 * on(mp_proto::F_NAV), strobe * on(mp_proto::F_STROBE), beacon * on(mp_proto::F_BEACON), on(mp_proto::F_LANDING)];
             for (i, p) in model.pieces.iter().enumerate() {
-                let hide = match p.vis {
-                    airframe::Vis::Always => false,
-                    airframe::Vis::SlowProp => blur >= 1.0,
-                    airframe::Vis::FastProp => blur <= 0.0,
-                    airframe::Vis::Chute => true,
-                };
+                let hide = !model.shown(p, blur, false, &|x| pup.input(x));
                 if hide {
                     continue;
                 }
@@ -5882,12 +5877,7 @@ impl Game {
                 if far_out && self.piece_inner[i] {
                     continue;
                 }
-                let hide = match p.vis {
-                    airframe::Vis::Always => false,
-                    airframe::Vis::SlowProp => blur >= 1.0,
-                    airframe::Vis::FastProp => blur <= 0.0,
-                    airframe::Vis::Chute => self.plane.spoilers < 0.02,
-                };
+                let hide = !self.model.shown(p, blur, self.plane.spoilers >= 0.02, &|x| self.plane.input(x));
                 if hide || dm.hidden(p) || self.weapons.hides_piece(p.name) {
                     continue;
                 }

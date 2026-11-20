@@ -16,7 +16,7 @@
 //! z up (an AC point (x, y, z) is (x, -z, y) there); ours is +X right,
 //! +Y up, -Z forward (FlightGear (x, y, z) is (y, z, x) here).
 
-use crate::airframe::{self, Anim, Curve, Drive, Input, Mesh, Model, Motion, Piece, Role, Vis};
+use crate::airframe::{self, Anim, CmpOp, Cond, Curve, Drive, Input, Mesh, Model, Motion, Piece, Role, Vis};
 use crate::render::PartVertex;
 use glam::{Mat3, Mat4, Vec3};
 use std::collections::HashMap;
@@ -383,6 +383,8 @@ struct AnimDef {
     prop: bool,
     gear_leg: Option<u8>,
     surface: Option<Role>,
+    /// a select on something we model (the gear, flaps...): checked as the plane flies
+    cond: Option<Cond>,
 }
 
 /// One mesh object of the whole model, its vertices in the root model frame.
@@ -485,6 +487,55 @@ fn cond_eval(n: roxmltree::Node, fast: &mut Option<bool>) -> bool {
         }
         "property" => false,
         _ => true,
+    }
+}
+
+/// A select's condition, if it turns on something we model (gear, flaps, speedbrake, throttle, fan speed):
+/// those parts checked as the plane flies, every other property held at rest.
+fn live_condition(n: roxmltree::Node, ext: &Ext) -> Option<Cond> {
+    let mut live = false;
+    let c = live_eval(n, ext, &mut live);
+    live.then_some(c)
+}
+fn live_input(p: &str, ext: &Ext) -> Option<(Input, f32)> {
+    // (angles that wrap, the propeller's and the wheels', mean nothing compared with a value)
+    input_of(p, ext).filter(|(i, _)| !matches!(i, Input::Prop | Input::Wheel(_)))
+}
+fn live_eval(n: roxmltree::Node, ext: &Ext, live: &mut bool) -> Cond {
+    let kids: Vec<_> = n.children().filter(|c| c.is_element()).collect();
+    match n.tag_name().name() {
+        "condition" | "and" => Cond::All(kids.iter().map(|c| live_eval(*c, ext, live)).collect()),
+        "or" => Cond::Any(kids.iter().map(|c| live_eval(*c, ext, live)).collect()),
+        "not" => Cond::Not(Box::new(Cond::All(kids.iter().map(|c| live_eval(*c, ext, live)).collect()))),
+        op @ ("equals" | "not-equals" | "greater-than" | "greater-than-equals" | "less-than" | "less-than-equals") => {
+            let props: Vec<&str> = kids.iter().filter(|c| c.has_tag_name("property")).filter_map(|c| c.text()).collect();
+            if let [p] = props[..] {
+                if let Some((input, unit)) = live_input(p, ext) {
+                    let val = kids.iter().find(|c| c.has_tag_name("value")).and_then(|c| c.text()).map(str::trim).unwrap_or("0");
+                    let y: f32 = val.parse().unwrap_or(if val.eq_ignore_ascii_case("true") { 1.0 } else { 0.0 });
+                    let op = match op {
+                        "equals" => CmpOp::Eq,
+                        "not-equals" => CmpOp::Ne,
+                        "greater-than" => CmpOp::Gt,
+                        "greater-than-equals" => CmpOp::Ge,
+                        "less-than" => CmpOp::Lt,
+                        _ => CmpOp::Le,
+                    };
+                    *live = true;
+                    return Cond::Cmp(input, unit, op, y);
+                }
+            }
+            Cond::Const(cond_eval(n, &mut None))
+        }
+        // a bare property: true when it isn't zero
+        "property" => match n.text().and_then(|p| live_input(p, ext)) {
+            Some((input, unit)) => {
+                *live = true;
+                Cond::Cmp(input, unit, CmpOp::Ne, 0.0)
+            }
+            None => Cond::Const(false),
+        },
+        _ => Cond::Const(true),
     }
 }
 
@@ -658,7 +709,7 @@ impl<'a> Loader<'a> {
             "select" => Kind::Select,
             _ => return None,
         };
-        let mut d = AnimDef { kind, center: Vec3::ZERO, axis: Vec3::X, drive: None, rest: 0.0, vis: None, shown: true, prop: false, gear_leg: None, surface: None };
+        let mut d = AnimDef { kind, center: Vec3::ZERO, axis: Vec3::X, drive: None, rest: 0.0, vis: None, shown: true, prop: false, gear_leg: None, surface: None, cond: None };
         if let Kind::Select = kind {
             let c = a.children().find(|c| c.has_tag_name("condition"))?;
             let (shown, fast) = condition(c);
@@ -667,6 +718,9 @@ impl<'a> Loader<'a> {
                 d.vis = Some(if f { Vis::FastProp } else { Vis::SlowProp });
                 d.shown = true;
                 d.prop = true;
+            } else if let Some(lc) = live_condition(c, self.ext) {
+                d.cond = Some(lc);
+                d.shown = true;
             }
             return Some(d);
         }
@@ -870,6 +924,8 @@ impl Ext {
         // and breakable group; the static ones are baked into the vertices.
         let mut pieces: Vec<Piece> = Vec::new();
         let mut node_of: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
+        // the selects checked as it flies (`Vis::When`)
+        let mut conds: Vec<Cond> = Vec::new();
         let span = self.span.max(1.0);
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for o in &ld.objs {
@@ -890,6 +946,7 @@ impl Ext {
             }
             // Hidden at rest (a select that is off): left out; a propeller select: its visibility.
             let mut vis = Vis::Always;
+            let mut live: Vec<Cond> = Vec::new();
             let mut hidden = false;
             let mut prop = false;
             let mut leg: Option<u8> = None;
@@ -905,6 +962,8 @@ impl Ext {
                     Kind::Select => {
                         if let Some(v) = d.vis {
                             vis = v;
+                        } else if let Some(c) = &d.cond {
+                            live.push(c.clone());
                         } else if !d.shown {
                             hidden = true;
                         }
@@ -921,6 +980,14 @@ impl Ext {
             if hidden {
                 continue;
             }
+            if vis == Vis::Always && !live.is_empty() {
+                let c = if live.len() == 1 { live.pop().unwrap() } else { Cond::All(live) };
+                let i = conds.iter().position(|x| *x == c).unwrap_or_else(|| {
+                    conds.push(c);
+                    conds.len() - 1
+                });
+                vis = Vis::When(i.min(u16::MAX as usize) as u16);
+            }
             let name = a.name.to_ascii_lowercase();
             if name.contains("shadow") || name.contains("halo") || name.contains("light-cone") || name == "lightcone" {
                 continue;
@@ -930,7 +997,7 @@ impl Ext {
             let bv: Vec<Vec3> = fgv.iter().map(|v| to_body(*v)).collect();
             let (c_lo, c_hi) = bv.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(*v), h.max(*v)));
             let c = (c_lo + c_hi) * 0.5;
-            let group = if prop || vis != Vis::Always {
+            let group = if prop || matches!(vis, Vis::SlowProp | Vis::FastProp) {
                 airframe::G_PROP
             } else if leg.is_some() {
                 airframe::G_GEAR
@@ -1018,7 +1085,7 @@ impl Ext {
                     }
                 });
             }
-            let role = if prop || vis != Vis::Always { Role::Prop } else if let Some(l) = leg { Role::Gear(l.min(crate::aircraft::MAX_GEAR as u8 - 1)) } else { surface.unwrap_or(Role::Other) };
+            let role = if prop || matches!(vis, Vis::SlowProp | Vis::FastProp) { Role::Prop } else if let Some(l) = leg { Role::Gear(l.min(crate::aircraft::MAX_GEAR as u8 - 1)) } else { surface.unwrap_or(Role::Other) };
             for (mesh, is_glass) in [(solid, false), (glass, true)] {
                 if mesh.i.is_empty() {
                     continue;
@@ -1036,6 +1103,7 @@ impl Ext {
         }
         log::info!("FlightGear model {}: {} pieces, {} triangles, {} textures at {size}², read in {:.0} ms", self.model.display(), pieces.len(), n_tris, layers.len(), t0.elapsed().as_secs_f64() * 1000.0);
         let mut model = Model::finish(pieces);
+        model.conds = conds;
         model.tex = Some(std::sync::Arc::new(TexSet { size, layers }));
         Ok(model)
     }
@@ -1182,6 +1250,30 @@ mod tests {
         let dr = ld.anim(doc.root_element(), "rotate", Mat4::IDENTITY).unwrap().drive.unwrap();
         assert_eq!(dr.input, Input::Throttle);
         assert!((deg(dr, 0.0) - 15.0).abs() < 1e-3 && deg(dr, 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn gear_selects_are_checked_as_it_flies() {
+        let ext = Ext { dir: PathBuf::new(), fg_dir: String::new(), model: PathBuf::new(), paint: Paint::default(), origin: Vec3::ZERO, steer_max: 1.0, travel: Vec::new(), span: 10.0 };
+        let mut ld = Loader { ext: &ext, acs: Vec::new(), objs: Vec::new(), anims: Vec::new(), order: 0, warn: Vec::new(), paint: HashMap::new(), tex_over: HashMap::new() };
+        let gear = |g: f32| move |i: Input| if i == Input::Gear { g } else { 0.0 };
+        // The MiG-29's wheels: shown once the gear is out (hidden at rest, so they used to be left out altogether).
+        let mig = "<animation><type>select</type><object-name>wheel.L</object-name><condition><greater-than><property>gear/gear[1]/position-norm</property><value>0.0</value></greater-than></condition></animation>";
+        let doc = roxmltree::Document::parse(mig).unwrap();
+        let d = ld.anim(doc.root_element(), "select", Mat4::IDENTITY).unwrap();
+        assert!(d.shown && d.vis.is_none());
+        let c = d.cond.expect("a live condition");
+        assert!(!c.eval(&gear(0.0)) && c.eval(&gear(0.3)) && c.eval(&gear(1.0)));
+        // A closed door, unless a switch we don't model is on: the switch stays at rest (off), the gear is live.
+        let door = "<animation><type>select</type><object-name>door</object-name><condition><and><equals><property>/gear/gear[0]/position-norm</property><value>0</value></equals><not><property>controls/electric/battery-switch</property></not></and></condition></animation>";
+        let doc = roxmltree::Document::parse(door).unwrap();
+        let c = ld.anim(doc.root_element(), "select", Mat4::IDENTITY).unwrap().cond.expect("a live condition");
+        assert!(c.eval(&gear(0.0)) && !c.eval(&gear(1.0)));
+        // Nothing we model (a cockpit light switch): decided at rest, as before.
+        let sw = "<animation><type>select</type><object-name>l</object-name><condition><property>controls/electric/battery-switch</property></condition></animation>";
+        let doc = roxmltree::Document::parse(sw).unwrap();
+        let d = ld.anim(doc.root_element(), "select", Mat4::IDENTITY).unwrap();
+        assert!(d.cond.is_none() && !d.shown);
     }
 
     #[test]

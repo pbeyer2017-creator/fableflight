@@ -645,7 +645,7 @@ impl Plane {
     }
 
     /// The value an animation input has this instant (see airframe::Input).
-    fn input(&self, i: Input) -> f32 {
+    pub fn input(&self, i: Input) -> f32 {
         let s = self.stick.as_vec3();
         match i {
             Input::Aileron(side) => -side * s.z,

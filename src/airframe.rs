@@ -763,6 +763,52 @@ pub enum Vis {
     FastProp,
     /// a braking parachute, while it is out (no part of the airframe's bounds or wreckage)
     Chute,
+    /// while `Model::conds[i]` holds (a downloaded aircraft's `select`, such as wheels shown once the gear is out)
+    When(u16),
+}
+
+/// A FlightGear `select` condition on our inputs, checked every frame.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Cond {
+    All(Vec<Cond>),
+    Any(Vec<Cond>),
+    Not(Box<Cond>),
+    /// a property we don't model, at its value at rest
+    Const(bool),
+    /// input times the unit (FlightGear's units), compared with a value
+    Cmp(Input, f32, CmpOp, f32),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl Cond {
+    pub fn eval(&self, f: &impl Fn(Input) -> f32) -> bool {
+        match self {
+            Cond::All(c) => c.iter().all(|c| c.eval(f)),
+            Cond::Any(c) => c.iter().any(|c| c.eval(f)),
+            Cond::Not(c) => !c.eval(f),
+            Cond::Const(b) => *b,
+            Cond::Cmp(i, unit, op, y) => {
+                let x = f(*i) * unit;
+                match op {
+                    CmpOp::Eq => (x - y).abs() < 1e-4,
+                    CmpOp::Ne => (x - y).abs() >= 1e-4,
+                    CmpOp::Gt => x > *y,
+                    CmpOp::Ge => x >= *y,
+                    CmpOp::Lt => x < *y,
+                    CmpOp::Le => x <= *y,
+                }
+            }
+        }
+    }
 }
 
 pub struct Piece {
@@ -829,6 +875,21 @@ pub struct Model {
     pub groups: Vec<Mesh>,
     /// a downloaded aircraft's own textures (see fgmodel.rs), drawn from by its M_TEX surfaces
     pub tex: Option<std::sync::Arc<crate::fgmodel::TexSet>>,
+    /// the conditions `Vis::When` pieces are drawn under
+    pub conds: Vec<Cond>,
+}
+
+impl Model {
+    /// Whether a piece is drawn, given the plane's inputs (`blur`: how far its propeller has blurred, 0..1).
+    pub fn shown(&self, p: &Piece, blur: f32, chute_out: bool, input: &impl Fn(Input) -> f32) -> bool {
+        match p.vis {
+            Vis::Always => true,
+            Vis::SlowProp => blur < 1.0,
+            Vis::FastProp => blur > 0.0,
+            Vis::Chute => chute_out,
+            Vis::When(i) => self.conds.get(i as usize).map_or(true, |c| c.eval(input)),
+        }
+    }
 }
 
 /// One of the outside lights, found from its lens: the glow sprites and the
@@ -875,7 +936,7 @@ impl Model {
                 groups[p.group].append(&p.mesh);
             }
         }
-        Model { pieces, groups, tex: None }
+        Model { pieces, groups, tex: None, conds: Vec::new() }
     }
     /// Centre and half size of everything solid in it (body frame, at rest).
     /// (Temporal anti-aliasing tells the aircraft's pixels by this box. A NaN
